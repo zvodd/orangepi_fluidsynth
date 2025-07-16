@@ -1,0 +1,1 @@
+systemctl mask ctrl-alt-del.target

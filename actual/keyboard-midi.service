@@ -1,0 +1,35 @@
+[Unit]
+Description=Keyboard MIDI Synthesizer Service
+After=network-online.target sound.target multi-user.target
+Wants=network-online.target sound.target
+
+[Service]
+# User and Group to run the service as.
+# This user MUST have permissions to access /dev/input/event* and to use ALSA/Pulseaudio.
+# It's highly recommended to add your user to the 'input' and 'audio' groups:
+# sudo usermod -aG input,audio <your_username>
+# Then log out and back in.
+# Replace <your_username> with the actual user (e.g., 'armbian').
+User=root
+Group=input
+
+# Working directory for the script.
+# This is where your soundfont path should be relative to, if not absolute in the script.
+WorkingDirectory=/usr/local/bin/
+
+# The command to execute.
+ExecStart=/usr/bin/python3 /usr/local/bin/keyboard_midi_service.py
+
+# Restart the service if it crashes or stops for unexpected reasons.
+Restart=on-failure
+RestartSec=5s
+
+# StandardOutput and StandardError are redirected to syslog
+StandardOutput=journal
+StandardError=journal
+
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
+
