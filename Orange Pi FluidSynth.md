@@ -1,4 +1,25 @@
 
+### Usage
+
+- run `alsmixer`and up the volume
+
+- connect a usb keyboard to the opi and hit buttons
+
+### Controls
+- `1` - `+` , `q` - `\`, `a` -`'`, `z` - `/` keys are mapped to midi event keys
+  Mapping is like a guitar fretboard
+  Z key is E2
+  A key is A2
+  Q = D3
+  1 = G3
+- up down arrows change midi program, left and right change bank
+- shift + up / down shift octave
+
+#### todo
+add volume changing.
+limit bank/program select to available in soundfont.
+provide link  FluidGM soundfont
+
 Prior Art & Further Reading
 
 - https://github.com/toyoshim/opipad
