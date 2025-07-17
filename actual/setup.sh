@@ -10,4 +10,6 @@ sudo systemctl daemon-reload           # Reload systemd configurations
 sudo systemctl enable keyboard-midi.service # Enable to start on boot
 sudo systemctl start keyboard-midi.service  # Start immediately
 systemctl status keyboard-midi.service      # Check status
-journalctl -u keyboard-midi.service -f   
+journalctl -u keyboard-midi.service -f
+
+# systemctl status keyboard-midi.service
