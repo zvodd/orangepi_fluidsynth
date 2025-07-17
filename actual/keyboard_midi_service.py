@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import os
-import struct
-import select
-import glob
+import signal
+import sys
 import time
-import fcntl
+import traceback
+from queue import Queue, Empty
 from threading import Thread, Event
-from collections import deque
+import logging
 from evdev import InputDevice, categorize, ecodes, list_devices
 
 # --- Constants from <linux/input.h> ---
@@ -25,8 +25,10 @@ MIDI_MAP = {
     ecodes.KEY_M: 46, ecodes.KEY_COMMA: 47, ecodes.KEY_DOT: 48, ecodes.KEY_SLASH: 49, ecodes.KEY_BACKSLASH: 50
 }
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 class InputDeviceMonitor(Thread):
-    def __init__(self, event_queue: deque):
+    def __init__(self, event_queue: Queue):
         super().__init__()
         self.daemon = True
         self._stop_event = Event()
@@ -34,25 +36,26 @@ class InputDeviceMonitor(Thread):
         self._event_queue = event_queue
         self.device_path = None
         self.device_name = None
-        print("InputDeviceMonitor initialized.")
+        logging.info("InputDeviceMonitor initialized.")
 
     def _find_keyboard_device(self):
-        print("InputDeviceMonitor: Searching for keyboard devices automatically...")
-        devices = [InputDevice(path) for path in list_devices()]
-        for device in devices:
+        logging.info("Searching for keyboard devices automatically...")
+        for path in list_devices():
+            device = None
             try:
-                if (ecodes.EV_KEY in device.capabilities() and
-                    (ecodes.KEY_Q in device.capabilities().get(ecodes.EV_KEY, []) or
-                     ecodes.KEY_A in device.capabilities().get(ecodes.EV_KEY, []) or
-                     ecodes.KEY_SPACE in device.capabilities().get(ecodes.EV_KEY, []))):
-                    print(f"InputDeviceMonitor: Found potential keyboard: {device.name} ({device.path})")
-                    return device
-                device.close()
+                device = InputDevice(path)
+                logging.debug(f"Checking device: {device.name} ({device.path})")
+                capabilities = device.capabilities()
+                if (ecodes.EV_KEY in capabilities and
+                    any(key in capabilities.get(ecodes.EV_KEY, []) for key in [ecodes.KEY_Q, ecodes.KEY_A, ecodes.KEY_SPACE])):
+                    logging.info(f"Found potential keyboard: {device.name} ({device.path})")
+                    return device  # Return without closing; we'll grab it later
             except Exception as e:
-                print(f"InputDeviceMonitor: Error checking device {device.path}: {e}")
-                if device.is_open():
+                logging.error(f"Error checking device {path}: {e}")
+            finally:
+                if device and device.fd != -1 and device.path != path:  # Close only if not returning it
                     device.close()
-        print("InputDeviceMonitor: No suitable keyboard device found.")
+        logging.warning("No suitable keyboard device found.")
         return None
 
     def _open_device(self, device_obj):
@@ -61,71 +64,66 @@ class InputDeviceMonitor(Thread):
             self._device = device_obj
             self.device_path = device_obj.path
             self.device_name = device_obj.name
-            print(f"InputDeviceMonitor: Successfully opened and grabbed keyboard device: {self.device_name} ({self.device_path})")
+            logging.info(f"Successfully opened and grabbed keyboard device: {self.device_name} ({self.device_path})")
             return True
         except PermissionError:
-            print(f"InputDeviceMonitor: Permission denied to open {device_obj.path}.")
-            print("InputDeviceMonitor: Ensure the user running this script is in the 'input' group.")
+            logging.error(f"Permission denied to open {device_obj.path}. Ensure user is in 'input' group.")
             return False
         except OSError as e:
-            print(f"InputDeviceMonitor: Error opening device {device_obj.path}: {e}")
+            logging.error(f"Error opening device {device_obj.path}: {e}")
             return False
         except Exception as e:
-            print(f"InputDeviceMonitor: Unexpected error opening device {device_obj.path}: {e}")
+            logging.error(f"Unexpected error opening device {device_obj.path}: {e}")
             return False
 
     def _close_device(self):
-        if self._device:
-            print(f"InputDeviceMonitor: Closing device {self.device_name} ({self.device_path})")
+        if self._device and self._device.fd != -1:
+            logging.info(f"Closing device {self.device_name} ({self.device_path})")
             try:
                 self._device.ungrab()
             except OSError as e:
-                print(f"InputDeviceMonitor: Warning: Could not ungrab device {self.device_name}: {e}")
+                logging.warning(f"Could not ungrab device {self.device_name}: {e}")
             self._device.close()
-            self._device = None
-            self.device_path = None
-            self.device_name = None
-        self._event_queue.clear()
+        self._device = None
+        self.device_path = None
+        self.device_name = None
+        self._event_queue.queue.clear()  # Clear queue safely
 
     def run(self):
         while not self._stop_event.is_set():
-            if not self._device or not self._device.is_open():
+            if not self._device or self._device.fd == -1:
                 self._close_device()
-                print("InputDeviceMonitor: Device disconnected or not yet found. Scanning...")
+                logging.info("Device disconnected or not yet found. Scanning...")
                 found_device = self._find_keyboard_device()
                 if found_device:
                     if not self._open_device(found_device):
-                        print("InputDeviceMonitor: Failed to open found device. Retrying scan.")
+                        logging.warning("Failed to open found device. Retrying in 1s.")
                         time.sleep(1)
                         continue
                 else:
                     time.sleep(3)
                     continue
-
             try:
                 for event in self._device.read_loop():
                     if self._stop_event.is_set():
                         break
                     if event.type == EV_KEY:
-                        self._event_queue.append(event)
+                        self._event_queue.put(event)
             except OSError as e:
-                print(f"InputDeviceMonitor: Error reading from device {self.device_name} ({self.device_path}): {e}")
+                logging.error(f"Error reading from device {self.device_name} ({self.device_path}): {e}")
                 self._close_device()
             except Exception as e:
-                print(f"InputDeviceMonitor: Unexpected error in read_loop: {e}")
+                logging.error(f"Unexpected error in read_loop: {e}")
                 self._close_device()
-
-            if self._stop_event.is_set():
-                break
-
         self._close_device()
-        print("InputDeviceMonitor: Thread stopped.")
+        logging.info("InputDeviceMonitor: Thread stopped.")
 
     def stop(self):
         self._stop_event.set()
-        if self._device:
+        if self._device and self._device.fd != -1:
             try:
                 self._device.ungrab()
+                self._device.close()  # Interrupt any blocking read
             except OSError:
                 pass
 
@@ -144,54 +142,46 @@ class KeyboardMIDISynthesizer:
         self.fs = None
         self.active_notes = {}
         self.current_bank = 0
-        self.current_program = 52
+        self.current_program = 52  # Choir Aahs
+        self.max_banks = 128  # Assume GM standard; adjust for your SoundFont
         self.octave_offset = 0
         self.pressed_modifiers = set()
         self.sfid = None
         self._initialize_fluidsynth()
 
     def _initialize_fluidsynth(self):
-        print("KeyboardMIDISynthesizer: Initializing FluidSynth...")
+        logging.info("Initializing FluidSynth...")
         try:
             import fluidsynth
             self.fs = fluidsynth.Synth(gain=1.0)
             self.fs.start(driver=self.audio_driver)
             if not os.path.exists(self.soundfont_path):
-                print(f"Error: Soundfont not found at {self.soundfont_path}")
-                self.fs.delete()
-                self.fs = None
-                return
-
-            sfid = self.fs.sfload(self.soundfont_path)
-            if sfid == -1:
-                print(f"Error: Failed to load soundfont {self.soundfont_path}")
-                self.fs.delete()
-                self.fs = None
-                return
-
-            self.sfid = sfid
-            self.fs.program_select(0, self.sfid, self.current_bank, self.current_program)
-            print("KeyboardMIDISynthesizer: FluidSynth initialized successfully.")
+                raise FileNotFoundError(f"Soundfont not found at {self.soundfont_path}")
+            self.sfid = self.fs.sfload(self.soundfont_path)
+            if self.sfid == -1:
+                raise RuntimeError(f"Failed to load soundfont {self.soundfont_path}")
+            self._select_program()
+            logging.info("FluidSynth initialized successfully.")
         except ImportError:
-            print("Error: fluidsynth library not found. Please install it.")
+            logging.error("fluidsynth library not found. Please install it.")
             self.fs = None
         except Exception as e:
-            print(f"KeyboardMIDISynthesizer: Failed to initialize FluidSynth: {e}")
+            logging.error(f"Failed to initialize FluidSynth: {e}")
             if self.fs:
                 self.fs.delete()
             self.fs = None
 
+    def _select_program(self):
+        if self.fs:
+            self.fs.program_select(0, self.sfid, self.current_bank, self.current_program)
+            logging.info(f"Selected program {self.current_program} in bank {self.current_bank}")
 
     def process_event(self, event):
         if self.fs is None:
-            self._initialize_fluidsynth()
-            if self.fs is None:
-                return
-
+            return  # Don't retry here; init happens once
         if event.type == EV_KEY:
             key_code = event.code
             key_value = event.value
-
             if key_code in self.MODIFIER_KEYS:
                 if key_value == 1:
                     self.pressed_modifiers.add(key_code)
@@ -199,94 +189,85 @@ class KeyboardMIDISynthesizer:
                     self.pressed_modifiers.discard(key_code)
             elif key_code in self.ARROW_KEYS and key_value == 1:
                 direction = self.ARROW_KEYS[key_code]
-                if self.pressed_modifiers:
+                if self.pressed_modifiers:  # Shift + Arrow: Octave shift
                     if direction == 'up' and self.octave_offset < 5:
                         self.octave_offset += 1
-                        print(f"Octave offset increased to {self.octave_offset}")
+                        logging.info(f"Octave offset increased to {self.octave_offset}")
                     elif direction == 'down' and self.octave_offset > -5:
                         self.octave_offset -= 1
-                        print(f"Octave offset decreased to {self.octave_offset}")
-                # else:
-                #     if direction == 'up':
-                #         self.current_program = (self.current_program + 1) % 128
-                #     elif direction == 'down':
-                #         self.current_program = (self.current_program - 1) % 128
-                #     elif direction == 'left':
-                #         self.current_bank = (self.current_bank - 1) % self.banks_max
-                #     elif direction == 'right':
-                #         self.current_bank = (self.current_bank + 1) % self.banks_max
-                #     #try:
-                #     self.fs.program_select(0, self.sfid, self.current_bank, self.current_program)
-                #         #fluid synth 1.1.11 doesn't have this.
-                #         #preset_name = self.fs.sfpreset_name(self.sfid, self.current_bank, self.current_program)
-                #         #print(f"Selected program {self.current_program} ({preset_name}) in bank {self.current_bank}")
-                #     #except AttributeError:
-
-                #     print(f"Selected program {self.current_program} in bank {self.current_bank}")
-
+                        logging.info(f"Octave offset decreased to {self.octave_offset}")
+                else:  # Arrow alone: Program/Bank change
+                    if direction == 'up':
+                        self.current_program = (self.current_program + 1) % 128
+                    elif direction == 'down':
+                        self.current_program = (self.current_program - 1) % 128
+                    elif direction == 'left':
+                        self.current_bank = (self.current_bank - 1) % self.max_banks
+                    elif direction == 'right':
+                        self.current_bank = (self.current_bank + 1) % self.max_banks
+                    self._select_program()
             elif key_code == KEY_BACKSPACE and key_value == 1:
-                self.fs.cc(0, 123, 0)
+                self.fs.cc(0, 123, 0)  # All notes off
                 self.active_notes.clear()
-                print("KeyboardMIDISynthesizer: All MIDI notes off.")
+                logging.info("All MIDI notes off.")
             elif key_code in MIDI_MAP:
                 base_note = MIDI_MAP[key_code]
                 midi_note = max(0, min(127, base_note + 12 * self.octave_offset))
-                if key_value == 1 or key_value == 2:
+                if key_value == 1 or key_value == 2:  # Press or repeat
                     if key_code not in self.active_notes:
                         self.fs.noteon(0, midi_note, 100)
                         self.active_notes[key_code] = midi_note
-                elif key_value == 0:
+                elif key_value == 0:  # Release
                     if key_code in self.active_notes:
                         self.fs.noteoff(0, self.active_notes[key_code])
                         del self.active_notes[key_code]
 
     def cleanup(self):
         if self.fs:
-            print("KeyboardMIDISynthesizer: Cleaning up FluidSynth...")
+            logging.info("Cleaning up FluidSynth...")
             self.fs.delete()
             self.fs = None
 
-def main():
-    event_queue = deque()
-    soundfont_path = "/usr/local/share/soundfonts/FluidR3_GM.sf2"
-    audio_driver = "alsa"
+def signal_handler(sig, frame):
+    logging.info("SIGTERM received. Shutting down...")
+    sys.exit(0)
 
-    print("Main: Starting InputDeviceMonitor thread...")
+def main():
+    signal.signal(signal.SIGTERM, signal_handler)  # For systemd stop
+    event_queue = Queue()
+    soundfont_path = os.environ.get('SOUNDFONT_PATH', '/usr/local/share/soundfonts/FluidR3_GM.sf2')
+    audio_driver = "alsa"
+    logging.info("Starting InputDeviceMonitor thread...")
     monitor = InputDeviceMonitor(event_queue)
     monitor.start()
-
-    print("Main: Initializing KeyboardMIDISynthesizer...")
+    logging.info("Initializing KeyboardMIDISynthesizer...")
     synthesizer = KeyboardMIDISynthesizer(soundfont_path, audio_driver)
-
+    if synthesizer.fs is None:
+        logging.error("Failed to initialize synthesizer. Exiting.")
+        sys.exit(1)
     try:
         while True:
             try:
-                event = event_queue.popleft()
+                event = event_queue.get(timeout=0.1)  # Block with timeout to check thread health
                 synthesizer.process_event(event)
-            except IndexError:
-                time.sleep(0.01)
-            
-            if not monitor.is_alive():
-                print("Main: InputDeviceMonitor thread died unexpectedly. Exiting.")
-                break
-
+            except Empty:
+                if not monitor.is_alive():
+                    logging.error("InputDeviceMonitor thread died unexpectedly. Exiting.")
+                    break
     except KeyboardInterrupt:
-        print("\nMain: Ctrl+C detected. Shutting down...")
+        logging.info("Ctrl+C detected. Shutting down...")
     except Exception as e:
-        import traceback
-        import sys
         traceback.print_exc(file=sys.stdout)
-        print(f"Main: An unexpected error occurred in the main loop: {e}")
+        logging.error(f"An unexpected error occurred in the main loop: {e}")
     finally:
-        print("Main: Stopping InputDeviceMonitor...")
+        logging.info("Stopping InputDeviceMonitor...")
         monitor.stop()
         monitor.join(timeout=5)
         if monitor.is_alive():
-            print("Main: Warning: InputDeviceMonitor thread did not stop gracefully.")
-        
-        print("Main: Cleaning up KeyboardMIDISynthesizer...")
+            logging.warning("InputDeviceMonitor thread did not stop gracefully.")
+        logging.info("Cleaning up KeyboardMIDISynthesizer...")
         synthesizer.cleanup()
-        print("Main: Application finished.")
+        logging.info("Application finished.")
 
 if __name__ == "__main__":
     main()
