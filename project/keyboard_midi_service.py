@@ -233,6 +233,8 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 def main():
+    flag_exception_exit = False
+
     signal.signal(signal.SIGTERM, signal_handler)  # For systemd stop
     event_queue = Queue()
     soundfont_path = os.environ.get('SOUNDFONT_PATH', '/usr/local/share/soundfonts/FluidR3_GM.sf2')
@@ -244,7 +246,7 @@ def main():
     synthesizer = KeyboardMIDISynthesizer(soundfont_path, audio_driver)
     if synthesizer.fs is None:
         logging.error("Failed to initialize synthesizer. Exiting.")
-        sys.exit(1)
+        flag_exception_exit = True
     try:
         while True:
             try:
@@ -253,12 +255,15 @@ def main():
             except Empty:
                 if not monitor.is_alive():
                     logging.error("InputDeviceMonitor thread died unexpectedly. Exiting.")
+                    flag_exception_exit = True
                     break
     except KeyboardInterrupt:
         logging.info("Ctrl+C detected. Shutting down...")
     except Exception as e:
         traceback.print_exc(file=sys.stdout)
         logging.error(f"An unexpected error occurred in the main loop: {e}")
+        flag_exception_exit = True
+
     finally:
         logging.info("Stopping InputDeviceMonitor...")
         monitor.stop()
@@ -268,6 +273,9 @@ def main():
         logging.info("Cleaning up KeyboardMIDISynthesizer...")
         synthesizer.cleanup()
         logging.info("Application finished.")
+    
+    if flag_exception_exit:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
